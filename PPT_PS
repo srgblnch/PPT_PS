@@ -1,0 +1,669 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+# PPT_PS.py
+# tango-ds is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# tango-ds is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with tango-ds.  If not, see <http://www.gnu.org/licenses/>.
+
+'''Tango device server for PPT power supplies using ASCII protocol for ALBA.
+'''
+
+META = u"""
+    Author: Lothar Krause <lkrause@cells.es> for CELLS / ALBA synchrotron
+    License: GPL3+
+    $URL$
+    $LastChangedBy$
+    $Date$
+    $Revision$
+""".encode('latin1')
+
+# standard packages
+import errno
+import socket
+import traceback
+from copy import copy
+from types import StringType
+from time import time,sleep
+
+# special packages
+from PyTango import DevVoid, DevBoolean, DeviceClass, \
+    DevState, DevDouble, DevString, DevFailed, DevVarStringArray, \
+    DevShort, DevLong, Except, AttrQuality, Attribute, DeviceProxy, AttributeProxy, \
+    READ, READ_WRITE, SCALAR, SPECTRUM, \
+    DispLevel, Util, Database, Attr, UserDefaultAttrProp
+
+import PowerSupply.standard as PS
+from PowerSupply.util import UniqList
+
+
+# maximal number of errors
+MAX_ERR = 20
+
+FLAG_LIST = ( "_pulser_unit", "_hvps", "_hv_enabled", "_ready", "_remote" )
+INTERLOCK = [ "emergency stop or side panel open",
+    "external interlock or grounding rod",
+    "external 1", "external 2", "pulser unit sum fault",
+    "spare byte 25", "spare byte 26", "spare byte 27" ]
+
+IDX_PSS = 2
+
+INTERLOCK_THYRATRON = (
+    "Thyratron heater voltage too high",
+    "Thyratron heater voltage too low",
+    "Thyratron reservoir voltage too high",
+    "Thyratron reservoir voltage too low",
+    "Thyratron current sum too high",
+    "Thyratron current sum too low",
+    "Thyratron temperature"
+)
+
+MODE = "02:%s0000"
+NAN = float('NaN')
+ERROR = "10:ERR"
+OK = object()
+
+NC = "NC"
+
+ERROR_CODE_SOCKET = 0x10000
+ERROR_CODE_EXC    = 0x20000
+
+DS_ERRORS = [
+    'socket error',
+    'exception'
+]
+
+def myfloat(f):
+    '''Converts an object (string) to a float with the little
+       twist of handling the '±' character sometimes returned by PPT PS
+    '''
+    if isinstance(f, str):
+        f0 = f.partition('±.0')[0]
+        return float(f0)
+    else:
+        return float(f0)
+
+class PPT_PS(PS.PowerSupply):
+    """Control for PPT pulsed power supplies for ALBA kicker magnets.
+    """
+
+    PUSHED_ATTR = ( 'State', 'Status', 'VoltageSetpoint',
+        'PulserUnit', 'HVPS', 'HVEnabled', 'Ready' )
+
+    def __init__(self, cl, name):
+        PS.PowerSupply.__init__(self, cl, name)
+        self._socket = None
+        self._is_connected = False
+        PPT_PS.init_device(self)
+        # pychecker shut up
+        if False:
+            self.Port = None
+            self.push_change_event = None
+            self.Timeout = None
+            self.IpAddress = None
+            self.Interlock1 = None
+            self.Interlock2 = None
+            self.get_device_class = None
+            self.get_device_properties = None
+            self.add_attribute = None
+            self.Thyratron = None
+
+    def init_device(self, cl=None, name=None):
+        PS.PowerSupply.init_device(self, cl, name)
+        if not self.IpAddress:
+                raise Exception("device property 'IpAddress' not set")
+                self.IpAddress = "none"
+
+        # reconnect
+        self._disconnect()
+
+        # initialize to safe values
+        self._response = None
+
+        # Initialization to quiet pychecker warnings
+        ## assigned real values in de()
+        self._remote = False
+        self._pulser_unit = False
+        self._hvps = False
+        self._hv_enabled = False
+
+        self._ready = None
+        self._current = NAN
+        self._voltage = NAN
+        self._voltage_set = NAN
+        self._heater_voltage = NAN
+        self._preheating_time = NC
+        self._reservoir_voltage = NAN
+        self._error_code = 0
+        self._hvDischarge = False
+        self._hvDischargeTime = 3
+        self._hvDischargeTimeStamp = None
+        self._hvRemainingDischargeTime = 0
+        self._hvDischargeFinalState = (False,False,False)
+        self._interlock = []
+        self._interlock_thy = []
+        self.read_t = time()
+        self.probe_thyratron()
+        self.STAT.INITIALIZED()
+
+    @PS.ExceptionHandler
+    def delete_device(self):
+        PS.PowerSupply.delete_device(self)
+        self._disconnect()
+
+
+    ### Internal Functions ###
+    def probe_thyratron(self):
+        '''Checks wether power supply has a Thyratron and configures this device
+           accordingly.
+        '''
+        INTERLOCK[IDX_PSS] = self.Interlock1
+        INTERLOCK[IDX_PSS+1] = self.Interlock2
+
+        if not self.Thyratron: return
+        for (aname,athy) in PPT_PS_Class.attr_thyratron.iteritems():
+            atype = athy[0]
+            aunit = athy[1]
+            amin, amax = athy[2:4]
+            aprop = UserDefaultAttrProp()
+            aprop.set_unit(aunit)
+            if amin is not None: aprop.set_min_value(str(amin))
+            if amax is not None: aprop.set_max_value(str(amax))
+            attr = Attr(aname, atype)
+            attr.set_default_properties(aprop)
+            self.add_attribute(attr)
+            setattr(self, '_'+aname.lower(), None)
+        self.set_change_event("PreheatingTime", True, True)
+
+        # else non-thyratron -- remove dynamic attributes?
+
+    def _connect(self):
+        '''Etablishes connection when disconnected.
+        '''
+        if self._is_connected: return
+        REMOTE = (self.IpAddress, self.Port)
+        self._socket = socket.socket()
+        self._socket.settimeout(self.Timeout)
+        self._socket.connect(REMOTE)
+        self._fin = self._socket.makefile()
+        self._is_connected = True
+
+    def _disconnect(self):
+        '''Closes socket and frees its resources.
+           After this call the PPT will be disconnected.
+           No exceptions will be raised.
+        '''
+        self._is_connected = False
+        if self._socket is None: return
+        try:
+            self._socket.shutdown(socket.SHUT_RDWR)
+        except socket.error, exc:
+            if exc.args[0]==errno.ENOTCONN:
+                # transport endpoint was not connected or already disconnected
+                self.log.debug("%s",exc.args)
+            else:
+                self.log.exception('socket shutdown 1')
+        except Exception:
+            self.log.exception('socket shutdown 2')
+
+        try:
+            self._socket.close()
+        except Exception:
+            self.log.exception(exc)
+        self._socket = None
+
+    def _command(self, cmd):
+        '''Executes command 'cmd',
+           and returns response as Python string, or None if command was set
+           command.
+        '''
+        if not self._is_connected:
+            raise PS.PS_Exception('not connected')
+        try:
+            TAIL = ";\r\n"
+            cmd+=TAIL
+#            self.log.debug("send %s", repr(cmd))
+            self._socket.sendall(cmd)
+            # return empty string when set command
+            cmd_prefix = cmd[0:3]
+            r = self._fin.readline()
+#            self.log.debug("recv %s", repr(r))
+
+            if len(r)==0:
+                raise socket.timeout("read timed out")
+
+            if not r.endswith(TAIL):
+                fmt = "_command failed: response to command %r should be terminated by %r but response was %r."
+                msg = fmt % (cmd, TAIL, r)
+                raise PS.PS_Exception(msg)
+
+            elif int(cmd[:2])<=3:
+                if r==cmd:
+                    return OK
+                else:
+                    msg = "_command failed: set command %r must be acknowledged by echo, instead received %r." % (cmd,r)
+                    raise PS.PS_Exception(msg)
+            else:
+                # bites of the TAIL
+                r = r[:-3]
+
+            if r==ERROR:
+                raise PS.PS_Exception("command %s failed" % cmd)
+
+            elif r[:3] != cmd_prefix:
+                fmt = "_command Failed: response to command %r must begin with %r but response was %r."
+                msg = fmt % (cmd, cmd_prefix, r)
+                raise PS.PS_Exception("COMMAND_FAIL", msg, "_command")
+
+            else:
+                rval = r[3:]
+            return rval
+
+        except socket.error:
+            # cleanup socket properly
+            self._disconnect()
+            raise
+
+    def read(self, cmd_no):
+        '''Executes read command number cmd_no.
+        '''
+        cmd = "%02d:?" % cmd_no
+        return self._command(cmd)
+
+    def _update_mode(self, pu=None, hvps=None, hven=None, reset=False):
+        '''updates PC when pulser state, hv_enabled or hvps have been changed,
+           that is PC has been switched on or off to standby.
+        '''
+        if pu is None: pu = self._pulser_unit
+        if hvps is None:  hvps = self._hvps
+        if hven is None: hven = self._hv_enabled
+
+        if not hven: self._hv_enabled = False
+        mode = "%d%d%d%d" % (pu, hvps, hven, reset)
+        self._command(MODE % mode)
+
+    ### Commands ###
+    @PS.CommandExc
+    def Command(self, cmd):
+        LN = '\r\n'
+        result = self._command(LN.join(cmd))
+        if result is None:
+            return ['<None>']
+        elif result is OK:
+            return ['OK']
+        else:
+            return result.split(LN)
+
+    @PS.CommandExc
+    def UpdateState(self):
+        assert hasattr(self, "_voltage_set"), "device %s executes State() before initialization finished" % self.get_name()
+        new_error_code = 0
+        new_messages = UniqList()
+        try:
+            self._connect()
+            start_t = time()
+            dat = self.read(9)
+            self.read_t = t_up = (time()+start_t) / 2.0
+            self._values = valss = dat.split(';')
+
+            self._voltage_set = myfloat(valss[0])
+            self.push_change_event('VoltageSetpoint', self._voltage_set, t_up, PS.AQ_VALID)
+
+            # split flag string into individual boolean values
+            self._mode = flags = [ bool(int(v)) for v in valss[1] ]
+            flags[4] = not(flags[4])
+            for f, value in zip(FLAG_LIST, flags):
+                setattr(self, f, value)
+            (PU, HVPS, HVEN, READY) = flags[:4]
+            new_error_code |= int(valss[1], 2) << 20
+            self.push_change_event('PulserUnit', PU, t_up, PS.AQ_VALID)
+            self.push_change_event('HVPS', HVPS, t_up, PS.AQ_VALID)
+            self.push_change_event('HVEnabled', HVEN, t_up, PS.AQ_VALID)
+            self.push_change_event('Ready', READY, t_up, PS.AQ_VALID)
+            # parses interlock flags
+            self._interlock = tuple(idx for idx,v in enumerate(valss[2]) if bool(int(v)))
+            new_error_code |= int(valss[2], 2)
+            for idx in self._interlock:
+                new_messages.append(INTERLOCK[idx])
+
+            # handles Thyratron
+            if self.Thyratron:
+                # parses thyratron interlock flags
+                self._interlock_thy = tuple(idx for idx,v in enumerate(valss[3]) if bool(int(v)))
+                for idx in self._interlock_thy:
+                    if idx>=len(INTERLOCK_THYRATRON): break
+                    new_messages.append(INTERLOCK_THYRATRON[idx])
+
+                self._heater_voltage = float(valss[4])
+                self._reservoir_voltage = float(valss[5])
+                self._current = float(valss[6])
+                self._preheating_time = valss[7]
+                new_error_code |= int(valss[3], 2) << 8
+                self.push_change_event("PreheatingTime", self._preheating_time, t_up, PS.AQ_VALID)
+
+            PHT = PU and self._preheating_time!="00:00" and self._preheating_time!=NC
+
+            if self.get_state()==DevState.FAULT:
+                # must reset using ResetInterlocks
+                pass
+
+            # handles HV discharge (hvDischargeTime > 0 means this has been configured to be discharged)
+            elif self._hvDischarge:
+                if self._hvDischargeTime > 0 and (self._hvps and not self._hv_enabled):
+                    lapseTime = int(time()-self._hvDischargeTimeStamp)#round seconds from the time stamp
+                    remainingTime = self._hvDischargeTime - lapseTime
+                    if remainingTime <= 0:
+                        self._hvRemainingDischargeTime = 0
+                    else:
+                        self._hvRemainingDischargeTime = remainingTime
+                        self.STAT.BUSY("Discharging capacitors, %d seconds left"%self._hvRemainingDischargeTime)
+
+                if self._hvDischargeTime == 0 or self._hvRemainingDischargeTime == 0:
+                    self._update_mode(pu=self._hvDischargeFinalState[0],
+                                      hvps=self._hvDischargeFinalState[1],
+                                      hven=self._hvDischargeFinalState[2])
+                    self._hvDischarge = False
+                    self.STAT.STANDBY()
+
+            elif PU and PHT and not READY:
+                self.STAT.WARMING(self._preheating_time, new_messages)
+
+            # interlock handling
+            elif self._interlock or self._interlock_thy:
+                self.STAT.ALARMS(new_messages)
+
+            elif PU and HVPS and READY:
+                if HVEN :
+                    self.STAT.ON()
+                else:
+                    self.STAT.STANDBY('HVPS ready')
+
+            elif PU and not PHT:
+                self.STAT.STANDBY()#'pulser unit ready')
+
+            elif not any( (PU,HVPS,HVEN,READY) ):
+                self.STAT.OFF()
+
+            else:
+                txt = "unexpected state %s %s" % (valss[1], self._preheating_time)
+                raise Exception(txt)
+
+        except socket.timeout:
+            new_error_code |= ERROR_CODE_SOCKET
+            if not self.get_state() in (DevState.ALARM, DevState.FAULT) or self._is_connected:
+                what = 'control unit {0}'.format(self.IpAddress)
+                self.STAT.OFFLINE(what, "socket timeout")
+
+        except socket.error, exc:
+            new_error_code |= ERROR_CODE_SOCKET
+            if exc.args[0] in (104, 111, 113):
+                what = 'control unit {0}'.format(self.IpAddress)
+                detail = "{0} ({1})".format(exc.args[1], exc.args[0])
+                self.STAT.OFFLINE(what, detail)
+            else:
+                raise
+
+        except Exception, exc:
+            new_error_code |= ERROR_CODE_EXC
+            raise
+
+        finally:
+            self._error_code = new_error_code
+            self._messages = new_messages
+
+    @PS.CommandExc
+    def On(self):
+        self._update_mode(pu=True, hvps=True, hven=True)
+
+    @PS.CommandExc
+    def Off(self):
+        if self._hv_enabled:
+            #if is gonna stop and HV is enabled, before it must be discharged.
+            self._hvDischarge = True
+            self._hvDischargeTimeStamp = time()
+            self._hvDischargeFinalState = (False,False,False)
+            self._update_mode(pu=True, hvps=True, hven=False)
+        else:
+            self._update_mode(pu=False, hvps=False, hven=False)
+
+    @PS.CommandExc
+    def Standby(self):
+        if self._hv_enabled:
+            #if is gonna stop and HV is enabled, before it must be discharged.
+            self._hvDischarge = True
+            self._hvDischargeTimeStamp = time()
+            self._hvDischargeFinalState = (True,True,False)
+            self._update_mode(pu=True, hvps=True, hven=False)
+        else:#
+            if self._pulser_unit and (not self._hvps):
+                self._update_mode(pu=True, hvps=True, hven=False)
+            else:
+                self._update_mode(pu=True, hvps=False, hven=False)
+
+    @PS.CommandExc
+    def ResetInterlocks(self):
+        PS.PowerSupply.ResetInterlocks(self)
+        x = self._pulser_unit
+        self._update_mode(reset=0)
+        self._update_mode(reset=1)
+        self.STAT.RESET_FIN()
+
+    @PS.CommandExc
+    def SetMode(self, data):
+        logic = tuple( bool(int(d)) for d in data )
+        self._pulser_unit = logic[0]
+        self._hvps = logic[1]
+        self._hv_enabled = logic[2]
+        resetflag = logic[3]
+        self._update_mode(reset=resetflag)
+
+    ### Attributes ###
+
+    def set_attr(self, attr, value):
+        if value is None:
+            attr.set_quality(AttrQuality.ATTR_INVALID)
+        else:
+            attr.set_value_date_quality(value, self.read_t, AttrQuality.ATTR_VALID)
+        if not self._is_connected:
+            attr.set_quality(AttrQuality.ATTR_INVALID)
+
+    @PS.AttrExc
+    def read_SumCurrent(self, attr):
+        self.set_attr(attr, self._current)
+
+    @PS.AttrExc
+    def read_VoltageSetpoint(self, attr):
+        self.set_attr(attr, self._voltage_set)
+
+    @PS.AttrExc
+    def write_VoltageSetpoint(self, wattr):
+        volt_ref = wattr.get_write_value()
+        self._command("01:%07.1f" % volt_ref )
+        self.push_change_event('VoltageSetpoint', volt_ref, time(), PS.AQ_VALID)
+
+    @PS.AttrExc
+    def read_RemoteMode(self, attr):
+        self.set_attr(attr, self._remote)
+
+    @PS.AttrExc
+    def read_PreheatingTime(self, attr):
+        self.set_attr(attr, self._preheating_time)
+
+    @PS.AttrExc
+    def read_ReservoirVoltage(self, attr):
+        self.set_attr(attr, self._reservoir_voltage)
+
+    @PS.AttrExc
+    def read_HeaterVoltage(self, attr):
+        self.set_attr(attr, self._heater_voltage)
+
+    # switching on/off the PS
+
+    @PS.AttrExc
+    def read_PulserUnit(self, attr):
+        self.set_attr(attr, self._pulser_unit)
+
+    @PS.AttrExc
+    def write_PulserUnit(self, attr):
+        val = attr.get_write_value()
+        if self._hvDischarge:#if a discharge is in progress nothing to do
+            pass
+        elif (not val) and self._hv_enabled:
+            #if is gonna stop and HV is enabled, before it must be discharged.
+            self._hvDischarge = True
+            self._hvDischargeTimeStamp = time()
+            self._hvDischargeFinalState = (val,False,False)
+            self._update_mode(hven=False)
+        else:
+            self._update_mode(pu=val)
+
+    @PS.AttrExc
+    def read_HVPS(self, attr):
+        self.set_attr(attr, self._hvps)
+
+    @PS.AttrExc
+    def write_HVPS(self, attr):
+        val = attr.get_write_value()
+        if self._hvDischarge:#if a discharge is in progress nothing to do
+            pass
+        elif (not val) and self._hv_enabled:
+            #if is gonna stop and HV is enabled, before it must be discharged.
+            self._hvDischarge = True
+            self._hvDischargeTimeStamp = time()
+            self._hvDischargeFinalState = (self._pulser_unit,val,False)
+            self._update_mode(hven=False)
+        else:
+            self._update_mode(hvps=val)
+
+    @PS.AttrExc
+    def read_HVEnabled(self,attr):
+        self.set_attr(attr, self._hv_enabled)
+
+    @PS.AttrExc
+    def write_HVEnabled(self, attr):
+        val = attr.get_write_value()
+        if (not val):#in case of stop the HV
+            self._hvDischarge = True
+            self._hvDischargeTimeStamp = time()
+            self._hvDischargeFinalState = (self._pulser_unit,self._hvps,val)
+        else:
+            self._hvDischarge = False
+        self._update_mode(hven=val)
+
+    @PS.AttrExc
+    def read_Ready(self, attr):
+        self.set_attr(attr, self._ready)
+
+    @PS.AttrExc
+    def read_ErrorCode(self, attr):
+        self.set_attr(attr, self._error_code)
+
+    @PS.AttrExc
+    def read_HVDischargeTime(self, attr):
+        self.set_attr(attr, self._hvDischargeTime)
+
+    @PS.AttrExc
+    def write_HVDischargeTime(self, attr):
+        val = attr.get_write_value()
+        self._hvDischargeTime = int(val)
+
+    @PS.AttrExc
+    def read_HVRemainingDischargeTime(self, attr):
+        self.set_attr(attr, self._hvRemainingDischargeTime)
+
+class PPT_PS_Class(DeviceClass):
+    '''TANGO Class object for PPT_PS.
+    '''
+
+    # Class Properties
+    class_property_list = {
+    }
+
+    # Device Properties
+    device_property_list = PS.gen_property_list(opt=('IpAddress',), XI=2)
+    device_property_list.update({
+
+        'Timeout': [DevDouble,
+            "read timeout. Should be set to a value lower than the polling period",
+            [ 0.1 ] ],
+
+        'Port' : [ DevShort,
+            "port to connect to",
+            [ 8000 ] ],
+
+        'Thyratron' : [ DevBoolean,
+            "whether control unit is thyratron (1) or not (0)",
+            [ 0 ] ],
+
+        'Interlock1' : [ DevString, "message to be used for external interlock 1 (PSS1))",
+            "PSS interlock 1" ],
+
+        'Interlock2' : [ DevString, "message to be used for external interlock 2 (PSS2))",
+            "PSS interlock 2" ]
+    })
+
+    # Command definitions
+    cmd_list = PS.gen_cmd_list(opt=('UpdateState', 'Command', 'Standby'))
+    cmd_list['UpdateState'][2]['polling period'] = 100
+    cmd_list.update({
+        'SetMode' : [ [DevString, ""], [DevVoid,''] ],
+    })
+
+
+    # Attribute definitions
+    attr_list = PS.gen_attr_list(max_err=100)
+    attr_list.update({
+
+        'VoltageSetpoint': [ [DevDouble, SCALAR, READ_WRITE],
+            {
+                'format': '%6.1f',
+                'unit' : 'V',
+                'min value' : 0.0,
+            }
+        ],
+
+        'PulserUnit': [ [DevBoolean, SCALAR, READ_WRITE] ],
+        'HVPS' : [ [DevBoolean, SCALAR, READ_WRITE] ],
+        'HVEnabled' : [ [DevBoolean, SCALAR, READ_WRITE] ],
+        'ErrorCode' : [ [DevLong, SCALAR, READ] ,
+            {'description' : 'bit 0..7 interlocks, bit 8..15 thyratron interlocks, bit 16..23 DS codes, bit 24..28 mode bits'}
+        ],
+        'HVDischargeTime' : [ [DevLong, SCALAR, READ_WRITE],
+            {
+                'format':'%3d',
+                'unit':'seconds',
+                'min value':0,
+                'max value':600,
+                'Memorized':"true",
+                'description':"To stop the power supply, first the high voltage must be discharge."
+            }
+        ],
+        'HVRemainingDischargeTime' : [ [DevLong, SCALAR,READ],
+            {
+                'format':'%3d',
+                'unit':'seconds',
+                'description':'Time, in seconds, remaining to discharge the High Voltage Capacitors.'
+            }
+        ],
+    })
+    attr_thyratron = {
+        'HeaterVoltage': ( DevDouble, 'V', 0, 10),
+        'ReservoirVoltage': ( DevDouble, 'V', 0, 10),
+        'SumCurrent': (DevDouble, 'A', 0, 50),
+        'PreheatingTime': ( DevString, '', None, None, None, None)
+    }
+
+
+
+### DServer script ###
+if __name__ == '__main__':
+    PS.tango_main(PPT_PS)
